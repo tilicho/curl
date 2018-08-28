@@ -188,21 +188,348 @@ static curl_off_t VmsSpecialSize(const char *name,
 
 #define BUFFER_SIZE (100*1024)
 
+static struct per_transfer *transfers; /* first node */
+static struct per_transfer *transfersl; /* last node */
+
+static CURLcode add_transfer(struct per_transfer **per)
+{
+  *per = calloc(sizeof(struct per_transfer), 1);
+  if(!*per)
+    return CURLE_OUT_OF_MEMORY;
+  if(!transfers)
+    transfers = *per;
+
+  if(transfersl)
+    transfersl->next = *per;
+
+  transfersl = *per;
+  return CURLE_OK;
+}
+
+static CURLcode pre_transfer(struct GlobalConfig *global,
+                             struct per_transfer *per)
+{
+  if(per->separator_err)
+    fprintf(global->errors, "%s\n", per->separator_err);
+  if(per->separator)
+    printf("%s\n", per->separator);
+  return CURLE_OK;
+}
+
+/*
+ * Call this after a transfer has completed.
+ */
+static CURLcode post_transfer(struct GlobalConfig *global,
+                              struct OperationConfig *config,
+                              struct per_transfer *per,
+                              CURLcode result,
+                              bool *retryp)
+{
+  struct OutStruct *outs = &per->outs;
+  CURL *curl = per->curl;
+
+  *retryp = FALSE;
+
+  if(per->infdopen)
+    close(per->infd);
+
+#ifdef __VMS
+  if(is_vms_shell()) {
+    /* VMS DCL shell behavior */
+    if(!global->showerror)
+      vms_show = VMSSTS_HIDE;
+  }
+  else
+#endif
+    if(config->synthetic_error) {
+      ;
+    }
+    else if(result && global->showerror) {
+      fprintf(global->errors, "curl: (%d) %s\n", result,
+              (per->errorbuffer[0]) ? per->errorbuffer :
+              curl_easy_strerror(result));
+      if(result == CURLE_PEER_FAILED_VERIFICATION)
+        fputs(CURL_CA_CERT_ERRORMSG, global->errors);
+    }
+
+  /* Set file extended attributes */
+  if(!result && config->xattr && outs->fopened && outs->stream) {
+    int rc = fwrite_xattr(curl, fileno(outs->stream));
+    if(rc)
+      warnf(config->global, "Error setting extended attributes: %s\n",
+            strerror(errno));
+  }
+
+  if(!result && !outs->stream && !outs->bytes) {
+    /* we have received no data despite the transfer was successful
+       ==> force cration of an empty output file (if an output file
+       was specified) */
+    long cond_unmet = 0L;
+    /* do not create (or even overwrite) the file in case we get no
+       data because of unmet condition */
+    curl_easy_getinfo(curl, CURLINFO_CONDITION_UNMET, &cond_unmet);
+    if(!cond_unmet && !tool_create_output_file(outs))
+      result = CURLE_WRITE_ERROR;
+  }
+
+  /* Close the file */
+  if(outs->fopened && outs->stream) {
+    int rc = fclose(outs->stream);
+    if(!result && rc) {
+      /* something went wrong in the writing process */
+      result = CURLE_WRITE_ERROR;
+      fprintf(global->errors, "(%d) Failed writing body\n", result);
+    }
+  }
+  else if(!outs->s_isreg && outs->stream) {
+    /* Dump standard stream buffered data */
+    int rc = fflush(outs->stream);
+    if(!result && rc) {
+      /* something went wrong in the writing process */
+      result = CURLE_WRITE_ERROR;
+      fprintf(global->errors, "(%d) Failed writing body\n", result);
+    }
+  }
+
+  /* File time can only be set _after_ the file has been closed */
+  if(!result && config->remote_time && outs->s_isreg && outs->filename) {
+    /* Ask libcurl if we got a remote file time */
+    curl_off_t filetime = -1;
+    curl_easy_getinfo(curl, CURLINFO_FILETIME_T, &filetime);
+    setfiletime(filetime, outs->filename, config->global->errors);
+  }
+
+#ifdef USE_METALINK
+  if(!per->metalink && config->use_metalink && result == CURLE_OK) {
+    int rv = parse_metalink(config, outs, per->this_url);
+    if(rv == 0)
+      fprintf(config->global->errors, "Metalink: parsing (%s) OK\n",
+              per->this_url);
+    else if(rv == -1)
+      fprintf(config->global->errors, "Metalink: parsing (%s) FAILED\n",
+              per->this_url);
+  }
+  else if(per->metalink && result == CURLE_OK && !per->metalink_next_res) {
+    int rv = metalink_check_hash(global, per->mlfile, outs->filename);
+    if(rv == 0) {
+      per->metalink_next_res = 1;
+    }
+  }
+#endif /* USE_METALINK */
+
+  /* No more business with this output struct */
+  if(outs->alloc_filename)
+    Curl_safefree(outs->filename);
+#ifdef USE_METALINK
+  if(outs->metalink_parser)
+    metalink_parser_context_delete(outs->metalink_parser);
+#endif /* USE_METALINK */
+
+  if(outs->is_cd_filename && outs->stream && !global->mute &&
+     outs->filename)
+    printf("curl: Saved to filename '%s'\n", outs->filename);
+
+  /* if retry-max-time is non-zero, make sure we haven't exceeded the
+     time */
+  if(per->retry_numretries &&
+     (!config->retry_maxtime ||
+      (tvdiff(tvnow(), per->retrystart) <
+       config->retry_maxtime*1000L)) ) {
+    enum {
+      RETRY_NO,
+      RETRY_TIMEOUT,
+      RETRY_CONNREFUSED,
+      RETRY_HTTP,
+      RETRY_FTP,
+      RETRY_LAST /* not used */
+    } retry = RETRY_NO;
+    long response;
+    if((CURLE_OPERATION_TIMEDOUT == result) ||
+       (CURLE_COULDNT_RESOLVE_HOST == result) ||
+       (CURLE_COULDNT_RESOLVE_PROXY == result) ||
+       (CURLE_FTP_ACCEPT_TIMEOUT == result))
+      /* retry timeout always */
+      retry = RETRY_TIMEOUT;
+    else if(config->retry_connrefused &&
+            (CURLE_COULDNT_CONNECT == result)) {
+      long oserrno;
+      curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &oserrno);
+      if(ECONNREFUSED == oserrno)
+        retry = RETRY_CONNREFUSED;
+    }
+    else if((CURLE_OK == result) ||
+            (config->failonerror &&
+             (CURLE_HTTP_RETURNED_ERROR == result))) {
+      /* If it returned OK. _or_ failonerror was enabled and it
+         returned due to such an error, check for HTTP transient
+         errors to retry on. */
+      char *effective_url = NULL;
+      curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+      if(effective_url &&
+         checkprefix("http", effective_url)) {
+        /* This was HTTP(S) */
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
+
+        switch(response) {
+        case 500: /* Internal Server Error */
+        case 502: /* Bad Gateway */
+        case 503: /* Service Unavailable */
+        case 504: /* Gateway Timeout */
+          retry = RETRY_HTTP;
+          /*
+           * At this point, we have already written data to the output
+           * file (or terminal). If we write to a file, we must rewind
+           * or close/re-open the file so that the next attempt starts
+           * over from the beginning.
+           *
+           * TODO: similar action for the upload case. We might need
+           * to start over reading from a previous point if we have
+           * uploaded something when this was returned.
+           */
+          break;
+        }
+      }
+    } /* if CURLE_OK */
+    else if(result) {
+      long protocol;
+
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
+      curl_easy_getinfo(curl, CURLINFO_PROTOCOL, &protocol);
+
+      if((protocol == CURLPROTO_FTP || protocol == CURLPROTO_FTPS) &&
+         response / 100 == 4)
+        /*
+         * This is typically when the FTP server only allows a certain
+         * amount of users and we are not one of them.  All 4xx codes
+         * are transient.
+         */
+        retry = RETRY_FTP;
+    }
+
+    if(retry) {
+      static const char * const m[]={
+        NULL,
+        "timeout",
+        "connection refused",
+        "HTTP error",
+        "FTP error"
+      };
+
+      warnf(config->global, "Transient problem: %s "
+            "Will retry in %ld seconds. "
+            "%ld retries left.\n",
+            m[retry], per->retry_sleep/1000L, per->retry_numretries);
+
+      tool_go_sleep(per->retry_sleep);
+      per->retry_numretries--;
+      if(!config->retry_delay) {
+        per->retry_sleep *= 2;
+        if(per->retry_sleep > RETRY_SLEEP_MAX)
+          per->retry_sleep = RETRY_SLEEP_MAX;
+      }
+      if(outs->bytes && outs->filename && outs->stream) {
+        int rc;
+        /* We have written data to a output file, we truncate file
+         */
+        if(!global->mute)
+          fprintf(global->errors, "Throwing away %"
+                  CURL_FORMAT_CURL_OFF_T " bytes\n",
+                  outs->bytes);
+        fflush(outs->stream);
+        /* truncate file at the position where we started appending */
+#ifdef HAVE_FTRUNCATE
+        if(ftruncate(fileno(outs->stream), outs->init)) {
+          /* when truncate fails, we can't just append as then we'll
+             create something strange, bail out */
+          if(!global->mute)
+            fprintf(global->errors,
+                    "failed to truncate, exiting\n");
+          return CURLE_WRITE_ERROR;
+        }
+        /* now seek to the end of the file, the position where we
+           just truncated the file in a large file-safe way */
+        rc = fseek(outs->stream, 0, SEEK_END);
+#else
+        /* ftruncate is not available, so just reposition the file
+           to the location we would have truncated it. This won't
+           work properly with large files on 32-bit systems, but
+           most of those will have ftruncate. */
+        rc = fseek(outs->stream, (long)outs->init, SEEK_SET);
+#endif
+        if(rc) {
+          if(!global->mute)
+            fprintf(global->errors,
+                    "failed seeking to end of file, exiting\n");
+          return CURLE_WRITE_ERROR;
+        }
+        outs->bytes = 0; /* clear for next round */
+      }
+      *retryp = TRUE; /* curl_easy_perform loop */
+      return CURLE_OK;
+    }
+  } /* if retry_numretries */
+  else if(per->metalink) {
+    /* Metalink: Decide to try the next resource or
+       not. Basically, we want to try the next resource if
+       download was not successful. */
+    long response;
+    if(CURLE_OK == result) {
+      /* TODO We want to try next resource when download was
+         not successful. How to know that? */
+      char *effective_url = NULL;
+      curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+      if(effective_url &&
+         curl_strnequal(effective_url, "http", 4)) {
+        /* This was HTTP(S) */
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
+        if(response != 200 && response != 206) {
+          per->metalink_next_res = 1;
+          fprintf(global->errors,
+                  "Metalink: fetching (%s) from (%s) FAILED "
+                  "(HTTP status code %ld)\n",
+                  per->mlfile->filename, per->this_url, response);
+        }
+      }
+    }
+    else {
+      per->metalink_next_res = 1;
+      fprintf(global->errors,
+              "Metalink: fetching (%s) from (%s) FAILED (%s)\n",
+              per->mlfile->filename, per->this_url,
+              curl_easy_strerror(result));
+    }
+  }
+  if(per->metalink && !per->metalink_next_res)
+    fprintf(global->errors, "Metalink: fetching (%s) from (%s) OK\n",
+            per->mlfile->filename, per->this_url);
+
+  if(config->writeout)
+    ourWriteOut(per->curl, &per->outs, config->writeout);
+
+  /* Close function-local opened file descriptors */
+  if(per->heads.fopened && per->heads.stream)
+    fclose(per->heads.stream);
+
+  if(per->heads.alloc_filename)
+    Curl_safefree(per->heads.filename);
+
+  curl_easy_cleanup(per->curl);
+  free(per->this_url);
+  free(per->separator_err);
+  free(per->separator);
+  free(per->outfile);
+
+  return CURLE_OK;
+}
+
 static CURLcode operate_do(struct GlobalConfig *global,
                            struct OperationConfig *config)
 {
-  char errorbuffer[CURL_ERROR_SIZE];
   struct ProgressData progressbar;
   struct getout *urlnode;
-
-  struct HdrCbData hdrcbdata;
-  struct OutStruct heads;
-
+  struct HdrCbData *hdrcbdata = NULL;
   metalinkfile *mlfile_last = NULL;
-
-  CURL *curl = config->easy;
   char *httpgetfields = NULL;
-
   CURLcode result = CURLE_OK;
   unsigned long li;
   bool capath_from_env;
@@ -210,14 +537,10 @@ static CURLcode operate_do(struct GlobalConfig *global,
   /* Save the values of noprogress and isatty to restore them later on */
   bool orig_noprogress = global->noprogress;
   bool orig_isatty = global->isatty;
-
-  errorbuffer[0] = '\0';
-
-  /* default headers output stream is stdout */
-  memset(&hdrcbdata, 0, sizeof(struct HdrCbData));
-  memset(&heads, 0, sizeof(struct OutStruct));
-  heads.stream = stdout;
-  heads.config = config;
+  struct per_transfer *per;
+  bool retry;
+  CURL *curltls = curl_easy_init();
+  CURLSH *share = curl_share_init();
 
   /*
   ** Beyond this point no return'ing from this function allowed.
@@ -231,6 +554,13 @@ static CURLcode operate_do(struct GlobalConfig *global,
     result = CURLE_FAILED_INIT;
     goto quit_curl;
   }
+
+  /* sharing is caring */
+  curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+  curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+  curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+  curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+  curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_PSL);
 
   /* On WIN32 we can't set the path to curl-ca-bundle.crt
    * at compile time. So we look here for the file in two ways:
@@ -251,8 +581,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
      * a certificate bundle that was previously ignored. To maintain backward
      * compatibility, only perform this search if not using Schannel.
      */
-    result = curl_easy_getinfo(config->easy,
-                               CURLINFO_TLS_SSL_PTR,
+    result = curl_easy_getinfo(curltls, CURLINFO_TLS_SSL_PTR,
                                &tls_backend_info);
     if(result) {
       goto quit_curl;
@@ -342,29 +671,6 @@ static CURLcode operate_do(struct GlobalConfig *global,
     }
   }
 
-  /* Single header file for all URLs */
-  if(config->headerfile) {
-    /* open file for output: */
-    if(strcmp(config->headerfile, "-")) {
-      FILE *newfile = fopen(config->headerfile, "wb");
-      if(!newfile) {
-        warnf(config->global, "Failed to open %s\n", config->headerfile);
-        result = CURLE_WRITE_ERROR;
-        goto quit_curl;
-      }
-      else {
-        heads.filename = config->headerfile;
-        heads.s_isreg = TRUE;
-        heads.fopened = TRUE;
-        heads.stream = newfile;
-      }
-    }
-    else {
-      /* always use binary mode for protocol header output */
-      set_binmode(heads.stream);
-    }
-  }
-
   /*
   ** Nested loops start here.
   */
@@ -378,8 +684,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
     char *outfiles;
     unsigned long infilenum;
     URLGlob *inglob;
-
-    int metalink = 0; /* nonzero for metalink download. */
+    bool metalink = FALSE; /* metalink download? */
     metalinkfile *mlfile;
     metalink_resource *mlres;
 
@@ -492,64 +797,97 @@ static CURLcode operate_do(struct GlobalConfig *global,
       /* Here's looping around each globbed URL */
       for(li = 0 ; li < urlnum; li++) {
 
-        int infd;
-        bool infdopen;
-        char *outfile;
-        struct OutStruct outs;
-        struct InStruct input;
-        struct timeval retrystart;
+        struct OutStruct *outs;
+        struct InStruct *input;
         curl_off_t uploadfilesize;
-        long retry_numretries;
-        long retry_sleep_default;
-        long retry_sleep;
-        char *this_url = NULL;
-        int metalink_next_res = 0;
+        struct OutStruct *heads;
+        CURL *curl = curl_easy_init();
 
-        outfile = NULL;
-        infdopen = FALSE;
-        infd = STDIN_FILENO;
+        result = add_transfer(&per);
+        if(result || !curl) {
+          result = CURLE_OUT_OF_MEMORY;
+          goto show_error;
+        }
+        per->curl = curl;
+
+        /* default headers output stream is stdout */
+        heads = &per->heads;
+        heads->stream = stdout;
+        heads->config = config;
+
+        /* Single header file for all URLs */
+        if(config->headerfile) {
+          /* open file for output: */
+          if(strcmp(config->headerfile, "-")) {
+            FILE *newfile = fopen(config->headerfile, "wb");
+            if(!newfile) {
+              warnf(config->global, "Failed to open %s\n", config->headerfile);
+              result = CURLE_WRITE_ERROR;
+              goto quit_curl;
+            }
+            else {
+              heads->filename = config->headerfile;
+              heads->s_isreg = TRUE;
+              heads->fopened = TRUE;
+              heads->stream = newfile;
+            }
+          }
+          else {
+            /* always use binary mode for protocol header output */
+            set_binmode(heads->stream);
+          }
+        }
+
+
+        hdrcbdata = &per->hdrcbdata;
+
+        outs = &per->outs;
+        input = &per->input;
+
+        per->outfile = NULL;
+        per->infdopen = FALSE;
+        per->infd = STDIN_FILENO;
         uploadfilesize = -1; /* -1 means unknown */
 
         /* default output stream is stdout */
-        memset(&outs, 0, sizeof(struct OutStruct));
-        outs.stream = stdout;
-        outs.config = config;
+        outs->stream = stdout;
+        outs->config = config;
 
         if(metalink) {
           /* For Metalink download, use name in Metalink file as
              filename. */
-          outfile = strdup(mlfile->filename);
-          if(!outfile) {
+          per->outfile = strdup(mlfile->filename);
+          if(!per->outfile) {
             result = CURLE_OUT_OF_MEMORY;
             goto show_error;
           }
-          this_url = strdup(mlres->url);
-          if(!this_url) {
+          per->this_url = strdup(mlres->url);
+          if(!per->this_url) {
             result = CURLE_OUT_OF_MEMORY;
             goto show_error;
           }
         }
         else {
           if(urls) {
-            result = glob_next_url(&this_url, urls);
+            result = glob_next_url(&per->this_url, urls);
             if(result)
               goto show_error;
           }
           else if(!li) {
-            this_url = strdup(urlnode->url);
-            if(!this_url) {
+            per->this_url = strdup(urlnode->url);
+            if(!per->this_url) {
               result = CURLE_OUT_OF_MEMORY;
               goto show_error;
             }
           }
           else
-            this_url = NULL;
-          if(!this_url)
+            per->this_url = NULL;
+          if(!per->this_url)
             break;
 
           if(outfiles) {
-            outfile = strdup(outfiles);
-            if(!outfile) {
+            per->outfile = strdup(outfiles);
+            if(!per->outfile) {
               result = CURLE_OUT_OF_MEMORY;
               goto show_error;
             }
@@ -557,7 +895,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
         }
 
         if(((urlnode->flags&GETOUT_USEREMOTE) ||
-            (outfile && strcmp("-", outfile))) &&
+            (per->outfile && strcmp("-", per->outfile))) &&
            (metalink || !config->use_metalink)) {
 
           /*
@@ -565,12 +903,12 @@ static CURLcode operate_do(struct GlobalConfig *global,
            * decided we want to use the remote file name.
            */
 
-          if(!outfile) {
+          if(!per->outfile) {
             /* extract the file name from the URL */
-            result = get_url_file_name(&outfile, this_url);
+            result = get_url_file_name(&per->outfile, per->this_url);
             if(result)
               goto show_error;
-            if(!*outfile && !config->content_disposition) {
+            if(!*per->outfile && !config->content_disposition) {
               helpf(global->errors, "Remote file name has no length!\n");
               result = CURLE_WRITE_ERROR;
               goto quit_urls;
@@ -578,8 +916,8 @@ static CURLcode operate_do(struct GlobalConfig *global,
           }
           else if(urls) {
             /* fill '#1' ... '#9' terms from URL pattern */
-            char *storefile = outfile;
-            result = glob_match_url(&outfile, storefile, urls);
+            char *storefile = per->outfile;
+            result = glob_match_url(&per->outfile, storefile, urls);
             Curl_safefree(storefile);
             if(result) {
               /* bad globbing */
@@ -592,7 +930,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
              file output call */
 
           if(config->create_dirs || metalink) {
-            result = create_dir_hierarchy(outfile, global->errors);
+            result = create_dir_hierarchy(per->outfile, global->errors);
             /* create_dir_hierarchy shows error upon CURLE_WRITE_ERROR */
             if(result == CURLE_WRITE_ERROR)
               goto quit_urls;
@@ -604,7 +942,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
           if((urlnode->flags & GETOUT_USEREMOTE)
              && config->content_disposition) {
             /* Our header callback MIGHT set the filename */
-            DEBUGASSERT(!outs.filename);
+            DEBUGASSERT(!outs->filename);
           }
 
           if(config->resume_from_current) {
@@ -612,7 +950,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
                of the file as it is now and open it for append instead */
             struct_stat fileinfo;
             /* VMS -- Danger, the filesize is only valid for stream files */
-            if(0 == stat(outfile, &fileinfo))
+            if(0 == stat(per->outfile, &fileinfo))
               /* set offset to current file size: */
               config->resume_from = fileinfo.st_size;
             else
@@ -628,22 +966,22 @@ static CURLcode operate_do(struct GlobalConfig *global,
                                "ctx=stm", "rfm=stmlf", "rat=cr", "mrs=0");
 #else
             /* open file for output: */
-            FILE *file = fopen(outfile, config->resume_from?"ab":"wb");
+            FILE *file = fopen(per->outfile, config->resume_from?"ab":"wb");
 #endif
             if(!file) {
-              helpf(global->errors, "Can't open '%s'!\n", outfile);
+              helpf(global->errors, "Can't open '%s'!\n", per->outfile);
               result = CURLE_WRITE_ERROR;
               goto quit_urls;
             }
-            outs.fopened = TRUE;
-            outs.stream = file;
-            outs.init = config->resume_from;
+            outs->fopened = TRUE;
+            outs->stream = file;
+            outs->init = config->resume_from;
           }
           else {
-            outs.stream = NULL; /* open when needed */
+            outs->stream = NULL; /* open when needed */
           }
-          outs.filename = outfile;
-          outs.s_isreg = TRUE;
+          outs->filename = per->outfile;
+          outs->s_isreg = TRUE;
         }
 
         if(uploadfile && !stdin_upload(uploadfile)) {
@@ -652,8 +990,8 @@ static CURLcode operate_do(struct GlobalConfig *global,
            */
           struct_stat fileinfo;
 
-          this_url = add_file_name_to_url(curl, this_url, uploadfile);
-          if(!this_url) {
+          per->this_url = add_file_name_to_url(per->this_url, uploadfile);
+          if(!per->this_url) {
             result = CURLE_OUT_OF_MEMORY;
             goto show_error;
           }
@@ -689,19 +1027,19 @@ static CURLcode operate_do(struct GlobalConfig *global,
           }
           if(infd == -1)
 #else
-          infd = open(uploadfile, O_RDONLY | O_BINARY);
-          if((infd == -1) || fstat(infd, &fileinfo))
+          per->infd = open(uploadfile, O_RDONLY | O_BINARY);
+          if((per->infd == -1) || fstat(per->infd, &fileinfo))
 #endif
           {
             helpf(global->errors, "Can't open '%s'!\n", uploadfile);
-            if(infd != -1) {
-              close(infd);
-              infd = STDIN_FILENO;
+            if(per->infd != -1) {
+              close(per->infd);
+              per->infd = STDIN_FILENO;
             }
             result = CURLE_READ_ERROR;
             goto quit_urls;
           }
-          infdopen = TRUE;
+          per->infdopen = TRUE;
 
           /* we ignore file size for char/block devices, sockets, etc. */
           if(S_ISREG(fileinfo.st_mode))
@@ -734,22 +1072,22 @@ static CURLcode operate_do(struct GlobalConfig *global,
                   " file or a fixed auth type instead!\n");
           }
 
-          DEBUGASSERT(infdopen == FALSE);
-          DEBUGASSERT(infd == STDIN_FILENO);
+          DEBUGASSERT(per->infdopen == FALSE);
+          DEBUGASSERT(per->infd == STDIN_FILENO);
 
           set_binmode(stdin);
           if(!strcmp(uploadfile, ".")) {
-            if(curlx_nonblock((curl_socket_t)infd, TRUE) < 0)
+            if(curlx_nonblock((curl_socket_t)per->infd, TRUE) < 0)
               warnf(config->global,
-                    "fcntl failed on fd=%d: %s\n", infd, strerror(errno));
+                    "fcntl failed on fd=%d: %s\n", per->infd, strerror(errno));
           }
         }
 
         if(uploadfile && config->resume_from_current)
           config->resume_from = -1; /* -1 will then force get-it-yourself */
 
-        if(output_expected(this_url, uploadfile) && outs.stream &&
-           isatty(fileno(outs.stream)))
+        if(output_expected(per->this_url, uploadfile) && outs->stream &&
+           isatty(fileno(outs->stream)))
           /* we send the output to a tty, therefore we switch off the progress
              meter */
           global->noprogress = global->isatty = TRUE;
@@ -761,20 +1099,22 @@ static CURLcode operate_do(struct GlobalConfig *global,
         }
 
         if(urlnum > 1 && !global->mute) {
-          fprintf(global->errors, "\n[%lu/%lu]: %s --> %s\n",
-                  li + 1, urlnum, this_url, outfile ? outfile : "<stdout>");
+          per->separator_err =
+            aprintf("\n[%lu/%lu]: %s --> %s",
+                    li + 1, urlnum, per->this_url,
+                    per->outfile ? per->outfile : "<stdout>");
           if(separator)
-            printf("%s%s\n", CURLseparator, this_url);
+            per->separator = aprintf("%s%s", CURLseparator, per->this_url);
         }
         if(httpgetfields) {
           char *urlbuffer;
           /* Find out whether the url contains a file name */
-          const char *pc = strstr(this_url, "://");
+          const char *pc = strstr(per->this_url, "://");
           char sep = '?';
           if(pc)
             pc += 3;
           else
-            pc = this_url;
+            pc = per->this_url;
 
           pc = strrchr(pc, '/'); /* check for a slash */
 
@@ -790,33 +1130,39 @@ static CURLcode operate_do(struct GlobalConfig *global,
            * Then append ? followed by the get fields to the url.
            */
           if(pc)
-            urlbuffer = aprintf("%s%c%s", this_url, sep, httpgetfields);
+            urlbuffer = aprintf("%s%c%s", per->this_url, sep, httpgetfields);
           else
             /* Append  / before the ? to create a well-formed url
                if the url contains a hostname only
             */
-            urlbuffer = aprintf("%s/?%s", this_url, httpgetfields);
+            urlbuffer = aprintf("%s/?%s", per->this_url, httpgetfields);
 
           if(!urlbuffer) {
             result = CURLE_OUT_OF_MEMORY;
             goto show_error;
           }
 
-          Curl_safefree(this_url); /* free previous URL */
-          this_url = urlbuffer; /* use our new URL instead! */
+          Curl_safefree(per->this_url); /* free previous URL */
+          per->this_url = urlbuffer; /* use our new URL instead! */
         }
 
         if(!global->errors)
           global->errors = stderr;
 
-        if((!outfile || !strcmp(outfile, "-")) && !config->use_ascii) {
+        if((!per->outfile || !strcmp(per->outfile, "-")) &&
+           !config->use_ascii) {
           /* We get the output to stdout and we have not got the ASCII/text
              flag, then set stdout to be binary */
           set_binmode(stdout);
         }
 
         /* explicitly passed to stdout means okaying binary gunk */
-        config->terminal_binary_ok = (outfile && !strcmp(outfile, "-"));
+        config->terminal_binary_ok =
+          (per->outfile && !strcmp(per->outfile, "-"));
+
+        /* avoid having this setopt added to the --libcurl source
+           output */
+        curl_easy_setopt(curl, CURLOPT_SHARE, share);
 
         if(!config->tcp_nodelay)
           my_setopt(curl, CURLOPT_TCP_NODELAY, 0L);
@@ -825,8 +1171,8 @@ static CURLcode operate_do(struct GlobalConfig *global,
           my_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L);
 
         /* where to store */
-        my_setopt(curl, CURLOPT_WRITEDATA, &outs);
-        my_setopt(curl, CURLOPT_INTERLEAVEDATA, &outs);
+        my_setopt(curl, CURLOPT_WRITEDATA, per);
+        my_setopt(curl, CURLOPT_INTERLEAVEDATA, per);
         if(metalink || !config->use_metalink)
           /* what call to write */
           my_setopt(curl, CURLOPT_WRITEFUNCTION, tool_write_cb);
@@ -838,8 +1184,8 @@ static CURLcode operate_do(struct GlobalConfig *global,
 #endif /* USE_METALINK */
 
         /* for uploads */
-        input.fd = infd;
-        input.config = config;
+        input->fd = per->infd;
+        input->config = config;
         /* Note that if CURLOPT_READFUNCTION is fread (the default), then
          * lib/telnet.c will Curl_poll() on the input file descriptor
          * rather then calling the READFUNCTION at regular intervals.
@@ -847,7 +1193,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
          * behaviour, by omitting to set the READFUNCTION & READDATA options,
          * have not been determined.
          */
-        my_setopt(curl, CURLOPT_READDATA, &input);
+        my_setopt(curl, CURLOPT_READDATA, input);
         /* what call to read */
         my_setopt(curl, CURLOPT_READFUNCTION, tool_read_cb);
 
@@ -863,10 +1209,9 @@ static CURLcode operate_do(struct GlobalConfig *global,
         else
           my_setopt(curl, CURLOPT_BUFFERSIZE, (long)BUFFER_SIZE);
 
-        /* size of uploaded file: */
         if(uploadfilesize != -1)
           my_setopt(curl, CURLOPT_INFILESIZE_LARGE, uploadfilesize);
-        my_setopt_str(curl, CURLOPT_URL, this_url);     /* what to fetch */
+        my_setopt_str(curl, CURLOPT_URL, per->this_url);
         my_setopt(curl, CURLOPT_NOPROGRESS, global->noprogress?1L:0L);
         if(config->no_body)
           my_setopt(curl, CURLOPT_NOBODY, 1L);
@@ -938,7 +1283,7 @@ static CURLcode operate_do(struct GlobalConfig *global,
           my_setopt_str(curl, CURLOPT_LOGIN_OPTIONS, config->login_options);
         my_setopt_str(curl, CURLOPT_USERPWD, config->userpwd);
         my_setopt_str(curl, CURLOPT_RANGE, config->range);
-        my_setopt(curl, CURLOPT_ERRORBUFFER, errorbuffer);
+        my_setopt(curl, CURLOPT_ERRORBUFFER, per->errorbuffer);
         my_setopt(curl, CURLOPT_TIMEOUT_MS, (long)(config->timeout * 1000));
 
         switch(config->httpreq) {
@@ -1432,17 +1777,17 @@ static CURLcode operate_do(struct GlobalConfig *global,
 
         if(config->content_disposition
            && (urlnode->flags & GETOUT_USEREMOTE))
-          hdrcbdata.honor_cd_filename = TRUE;
+          hdrcbdata->honor_cd_filename = TRUE;
         else
-          hdrcbdata.honor_cd_filename = FALSE;
+          hdrcbdata->honor_cd_filename = FALSE;
 
-        hdrcbdata.outs = &outs;
-        hdrcbdata.heads = &heads;
-        hdrcbdata.global = global;
-        hdrcbdata.config = config;
+        hdrcbdata->outs = outs;
+        hdrcbdata->heads = heads;
+        hdrcbdata->global = global;
+        hdrcbdata->config = config;
 
         my_setopt(curl, CURLOPT_HEADERFUNCTION, tool_header_cb);
-        my_setopt(curl, CURLOPT_HEADERDATA, &hdrcbdata);
+        my_setopt(curl, CURLOPT_HEADERDATA, per);
 
         if(config->resolve)
           /* new in 7.21.3 */
@@ -1548,14 +1893,6 @@ static CURLcode operate_do(struct GlobalConfig *global,
           my_setopt_str(curl, CURLOPT_ALTSVC, config->altsvc);
 #endif
 
-        /* initialize retry vars for loop below */
-        retry_sleep_default = (config->retry_delay) ?
-          config->retry_delay*1000L : RETRY_SLEEP_DEFAULT; /* ms */
-
-        retry_numretries = config->req_retry;
-        retry_sleep = retry_sleep_default; /* ms */
-        retrystart = tvnow();
-
 #ifndef CURL_DISABLE_LIBCURL_OPTION
         if(global->libcurl) {
           result = easysrc_perform();
@@ -1568,382 +1905,38 @@ static CURLcode operate_do(struct GlobalConfig *global,
 #ifdef USE_METALINK
           if(!metalink && config->use_metalink) {
             /* If outs.metalink_parser is non-NULL, delete it first. */
-            if(outs.metalink_parser)
-              metalink_parser_context_delete(outs.metalink_parser);
-            outs.metalink_parser = metalink_parser_context_new();
-            if(outs.metalink_parser == NULL) {
+            if(outs->metalink_parser)
+              metalink_parser_context_delete(outs->metalink_parser);
+            outs->metalink_parser = metalink_parser_context_new();
+            if(outs->metalink_parser == NULL) {
               result = CURLE_OUT_OF_MEMORY;
               goto show_error;
             }
             fprintf(config->global->errors,
-                    "Metalink: parsing (%s) metalink/XML...\n", this_url);
+                    "Metalink: parsing (%s) metalink/XML...\n", per->this_url);
           }
           else if(metalink)
             fprintf(config->global->errors,
                     "Metalink: fetching (%s) from (%s)...\n",
-                    mlfile->filename, this_url);
+                    mlfile->filename, per->this_url);
 #endif /* USE_METALINK */
 
-#ifdef CURLDEBUG
-          if(config->test_event_based)
-            result = curl_easy_perform_ev(curl);
-          else
-#endif
-          result = curl_easy_perform(curl);
-
-          if(!result && !outs.stream && !outs.bytes) {
-            /* we have received no data despite the transfer was successful
-               ==> force cration of an empty output file (if an output file
-               was specified) */
-            long cond_unmet = 0L;
-            /* do not create (or even overwrite) the file in case we get no
-               data because of unmet condition */
-            curl_easy_getinfo(curl, CURLINFO_CONDITION_UNMET, &cond_unmet);
-            if(!cond_unmet && !tool_create_output_file(&outs))
-              result = CURLE_WRITE_ERROR;
-          }
-
-          if(outs.is_cd_filename && outs.stream && !global->mute &&
-             outs.filename)
-            printf("curl: Saved to filename '%s'\n", outs.filename);
-
-          /* if retry-max-time is non-zero, make sure we haven't exceeded the
-             time */
-          if(retry_numretries &&
-             (!config->retry_maxtime ||
-              (tvdiff(tvnow(), retrystart) <
-               config->retry_maxtime*1000L)) ) {
-            enum {
-              RETRY_NO,
-              RETRY_TIMEOUT,
-              RETRY_CONNREFUSED,
-              RETRY_HTTP,
-              RETRY_FTP,
-              RETRY_LAST /* not used */
-            } retry = RETRY_NO;
-            long response;
-            if((CURLE_OPERATION_TIMEDOUT == result) ||
-               (CURLE_COULDNT_RESOLVE_HOST == result) ||
-               (CURLE_COULDNT_RESOLVE_PROXY == result) ||
-               (CURLE_FTP_ACCEPT_TIMEOUT == result))
-              /* retry timeout always */
-              retry = RETRY_TIMEOUT;
-            else if(config->retry_connrefused &&
-                    (CURLE_COULDNT_CONNECT == result)) {
-              long oserrno;
-              curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &oserrno);
-              if(ECONNREFUSED == oserrno)
-                retry = RETRY_CONNREFUSED;
-            }
-            else if((CURLE_OK == result) ||
-                    (config->failonerror &&
-                     (CURLE_HTTP_RETURNED_ERROR == result))) {
-              /* If it returned OK. _or_ failonerror was enabled and it
-                 returned due to such an error, check for HTTP transient
-                 errors to retry on. */
-              char *effective_url = NULL;
-              curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-              if(effective_url &&
-                 checkprefix("http", effective_url)) {
-                /* This was HTTP(S) */
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
-
-                switch(response) {
-                case 408: /* Request Timeout */
-                case 500: /* Internal Server Error */
-                case 502: /* Bad Gateway */
-                case 503: /* Service Unavailable */
-                case 504: /* Gateway Timeout */
-                  retry = RETRY_HTTP;
-                  /*
-                   * At this point, we have already written data to the output
-                   * file (or terminal). If we write to a file, we must rewind
-                   * or close/re-open the file so that the next attempt starts
-                   * over from the beginning.
-                   *
-                   * TODO: similar action for the upload case. We might need
-                   * to start over reading from a previous point if we have
-                   * uploaded something when this was returned.
-                   */
-                  break;
-                }
-              }
-            } /* if CURLE_OK */
-            else if(result) {
-              long protocol;
-
-              curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
-              curl_easy_getinfo(curl, CURLINFO_PROTOCOL, &protocol);
-
-              if((protocol == CURLPROTO_FTP || protocol == CURLPROTO_FTPS) &&
-                 response / 100 == 4)
-                /*
-                 * This is typically when the FTP server only allows a certain
-                 * amount of users and we are not one of them.  All 4xx codes
-                 * are transient.
-                 */
-                retry = RETRY_FTP;
-            }
-
-            if(retry) {
-              static const char * const m[]={
-                NULL,
-                "timeout",
-                "connection refused",
-                "HTTP error",
-                "FTP error"
-              };
-
-              warnf(config->global, "Transient problem: %s "
-                    "Will retry in %ld seconds. "
-                    "%ld retries left.\n",
-                    m[retry], retry_sleep/1000L, retry_numretries);
-
-              tool_go_sleep(retry_sleep);
-              retry_numretries--;
-              if(!config->retry_delay) {
-                retry_sleep *= 2;
-                if(retry_sleep > RETRY_SLEEP_MAX)
-                  retry_sleep = RETRY_SLEEP_MAX;
-              }
-              if(outs.bytes && outs.filename && outs.stream) {
-                int rc;
-                /* We have written data to a output file, we truncate file
-                 */
-                if(!global->mute)
-                  fprintf(global->errors, "Throwing away %"
-                          CURL_FORMAT_CURL_OFF_T " bytes\n",
-                          outs.bytes);
-                fflush(outs.stream);
-                /* truncate file at the position where we started appending */
-#ifdef HAVE_FTRUNCATE
-                if(ftruncate(fileno(outs.stream), outs.init)) {
-                  /* when truncate fails, we can't just append as then we'll
-                     create something strange, bail out */
-                  if(!global->mute)
-                    fprintf(global->errors,
-                            "failed to truncate, exiting\n");
-                  result = CURLE_WRITE_ERROR;
-                  goto quit_urls;
-                }
-                /* now seek to the end of the file, the position where we
-                   just truncated the file in a large file-safe way */
-                rc = fseek(outs.stream, 0, SEEK_END);
-#else
-                /* ftruncate is not available, so just reposition the file
-                   to the location we would have truncated it. This won't
-                   work properly with large files on 32-bit systems, but
-                   most of those will have ftruncate. */
-                rc = fseek(outs.stream, (long)outs.init, SEEK_SET);
-#endif
-                if(rc) {
-                  if(!global->mute)
-                    fprintf(global->errors,
-                            "failed seeking to end of file, exiting\n");
-                  result = CURLE_WRITE_ERROR;
-                  goto quit_urls;
-                }
-                outs.bytes = 0; /* clear for next round */
-              }
-              continue; /* curl_easy_perform loop */
-            }
-          } /* if retry_numretries */
-          else if(metalink) {
-            /* Metalink: Decide to try the next resource or
-               not. Basically, we want to try the next resource if
-               download was not successful. */
-            long response;
-            if(CURLE_OK == result) {
-              /* TODO We want to try next resource when download was
-                 not successful. How to know that? */
-              char *effective_url = NULL;
-              curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-              if(effective_url &&
-                 curl_strnequal(effective_url, "http", 4)) {
-                /* This was HTTP(S) */
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response);
-                if(response != 200 && response != 206) {
-                  metalink_next_res = 1;
-                  fprintf(global->errors,
-                          "Metalink: fetching (%s) from (%s) FAILED "
-                          "(HTTP status code %ld)\n",
-                          mlfile->filename, this_url, response);
-                }
-              }
-            }
-            else {
-              metalink_next_res = 1;
-              fprintf(global->errors,
-                      "Metalink: fetching (%s) from (%s) FAILED (%s)\n",
-                      mlfile->filename, this_url,
-                      (errorbuffer[0]) ?
-                      errorbuffer : curl_easy_strerror(result));
-            }
-          }
-          if(metalink && !metalink_next_res)
-            fprintf(global->errors, "Metalink: fetching (%s) from (%s) OK\n",
-                    mlfile->filename, this_url);
+          per->metalink = metalink;
+          /* initialize retry vars for loop below */
+          per->retry_sleep_default = (config->retry_delay) ?
+            config->retry_delay*1000L : RETRY_SLEEP_DEFAULT; /* ms */
+          per->retry_numretries = config->req_retry;
+          per->retry_sleep = per->retry_sleep_default; /* ms */
+          per->retrystart = tvnow();
 
           /* In all ordinary cases, just break out of loop here */
           break; /* curl_easy_perform loop */
 
         }
-
-        if((global->progressmode == CURL_PROGRESS_BAR) &&
-           progressbar.calls)
-          /* if the custom progress bar has been displayed, we output a
-             newline here */
-          fputs("\n", progressbar.out);
-
-        if(config->writeout)
-          ourWriteOut(curl, &outs, config->writeout);
-
-        /*
-        ** Code within this loop may jump directly here to label 'show_error'
-        ** in order to display an error message for CURLcode stored in 'res'
-        ** variable and exit loop once that necessary writing and cleanup
-        ** in label 'quit_urls' has been done.
-        */
-
-        show_error:
-
-#ifdef __VMS
-        if(is_vms_shell()) {
-          /* VMS DCL shell behavior */
-          if(!global->showerror)
-            vms_show = VMSSTS_HIDE;
-        }
-        else
-#endif
-        if(config->synthetic_error) {
-          ;
-        }
-        else if(result && global->showerror) {
-          fprintf(global->errors, "curl: (%d) %s\n", result, (errorbuffer[0]) ?
-                  errorbuffer : curl_easy_strerror(result));
-          if(result == CURLE_PEER_FAILED_VERIFICATION)
-            fputs(CURL_CA_CERT_ERRORMSG, global->errors);
-        }
-
-        /* Fall through comment to 'quit_urls' label */
-
-        /*
-        ** Upon error condition and always that a message has already been
-        ** displayed, code within this loop may jump directly here to label
-        ** 'quit_urls' otherwise it should jump to 'show_error' label above.
-        **
-        ** When 'res' variable is _not_ CURLE_OK loop will exit once that
-        ** all code following 'quit_urls' has been executed. Otherwise it
-        ** will loop to the beginning from where it may exit if there are
-        ** no more urls left.
-        */
-
-        quit_urls:
-
-        /* Set file extended attributes */
-        if(!result && config->xattr && outs.fopened && outs.stream) {
-          int rc = fwrite_xattr(curl, fileno(outs.stream));
-          if(rc)
-            warnf(config->global, "Error setting extended attributes: %s\n",
-                  strerror(errno));
-        }
-
-        /* Close the file */
-        if(outs.fopened && outs.stream) {
-          int rc = fclose(outs.stream);
-          if(!result && rc) {
-            /* something went wrong in the writing process */
-            result = CURLE_WRITE_ERROR;
-            fprintf(global->errors, "(%d) Failed writing body\n", result);
-          }
-        }
-        else if(!outs.s_isreg && outs.stream) {
-          /* Dump standard stream buffered data */
-          int rc = fflush(outs.stream);
-          if(!result && rc) {
-            /* something went wrong in the writing process */
-            result = CURLE_WRITE_ERROR;
-            fprintf(global->errors, "(%d) Failed writing body\n", result);
-          }
-        }
-
-#ifdef __AMIGA__
-        if(!result && outs.s_isreg && outs.filename) {
-          /* Set the url (up to 80 chars) as comment for the file */
-          if(strlen(urlnode->url) > 78)
-            urlnode->url[79] = '\0';
-          SetComment(outs.filename, urlnode->url);
-        }
-#endif
-
-        /* File time can only be set _after_ the file has been closed */
-        if(!result && config->remote_time && outs.s_isreg && outs.filename) {
-          /* Ask libcurl if we got a remote file time */
-          curl_off_t filetime = -1;
-          curl_easy_getinfo(curl, CURLINFO_FILETIME_T, &filetime);
-          setfiletime(filetime, outs.filename, config->global->errors);
-        }
-
-#ifdef USE_METALINK
-        if(!metalink && config->use_metalink && result == CURLE_OK) {
-          int rv = parse_metalink(config, &outs, this_url);
-          if(rv == 0)
-            fprintf(config->global->errors, "Metalink: parsing (%s) OK\n",
-                    this_url);
-          else if(rv == -1)
-            fprintf(config->global->errors, "Metalink: parsing (%s) FAILED\n",
-                    this_url);
-        }
-        else if(metalink && result == CURLE_OK && !metalink_next_res) {
-          int rv = metalink_check_hash(global, mlfile, outs.filename);
-          if(rv == 0) {
-            metalink_next_res = 1;
-          }
-        }
-#endif /* USE_METALINK */
-
-        /* No more business with this output struct */
-        if(outs.alloc_filename)
-          Curl_safefree(outs.filename);
-#ifdef USE_METALINK
-        if(outs.metalink_parser)
-          metalink_parser_context_delete(outs.metalink_parser);
-#endif /* USE_METALINK */
-        memset(&outs, 0, sizeof(struct OutStruct));
-        hdrcbdata.outs = NULL;
-
-        /* Free loop-local allocated memory and close loop-local opened fd */
-
-        Curl_safefree(outfile);
-        Curl_safefree(this_url);
-
-        if(infdopen)
-          close(infd);
-
-        if(metalink) {
-          /* Should exit if error is fatal. */
-          if(is_fatal_error(result)) {
-            break;
-          }
-          if(!metalink_next_res)
-            break;
-          mlres = mlres->next;
-          if(mlres == NULL)
-            /* TODO If metalink_next_res is 1 and mlres is NULL,
-             * set res to error code
-             */
-            break;
-        }
-        else if(urlnum > 1) {
-          /* when url globbing, exit loop upon critical error */
-          if(is_fatal_error(result))
-            break;
-        }
-        else if(result)
-          /* when not url globbing, exit loop upon any error */
-          break;
-
       } /* loop to the next URL */
+
+      show_error:
+      quit_urls:
 
       /* Free loop-local allocated memory */
 
@@ -1991,9 +1984,43 @@ static CURLcode operate_do(struct GlobalConfig *global,
 
   } /* for-loop through all URLs */
 
-  /*
-  ** Nested loops end here.
-  */
+  /* Time to actually do the transfers, one by one or all at once! */
+  if(!result) {
+    CURLcode returncode = CURLE_OK;
+    for(per = transfers; per;) {
+      struct per_transfer *pernext = per->next;
+
+      result = pre_transfer(global, per);
+      if(result)
+        break;
+
+#ifdef CURLDEBUG
+      if(config->test_event_based)
+        result = curl_easy_perform_ev(per->curl);
+      else
+#endif
+        result = curl_easy_perform(per->curl);
+
+      returncode = result;
+
+      result = post_transfer(global, config, per, result, &retry);
+      free(per);
+      transfers = per = pernext;
+      if(result || returncode)
+        break;
+    }
+    result = returncode;
+  }
+  else {
+    /* no transfers, just cleanups */
+    for(per = transfers; per;) {
+      struct per_transfer *pernext = per->next;
+      (void)post_transfer(global, config, per, result, &retry);
+      free(per);
+      per = pernext;
+    }
+    transfers = NULL;
+  }
 
   quit_curl:
 
@@ -2007,17 +2034,11 @@ static CURLcode operate_do(struct GlobalConfig *global,
   /* Free list of given URLs */
   clean_getout(config);
 
-  hdrcbdata.heads = NULL;
-
-  /* Close function-local opened file descriptors */
-  if(heads.fopened && heads.stream)
-    fclose(heads.stream);
-
-  if(heads.alloc_filename)
-    Curl_safefree(heads.filename);
-
   /* Release metalink related resources here */
   clean_metalink(config);
+
+  curl_easy_cleanup(curltls);
+  curl_share_cleanup(share);
 
   return result;
 }
@@ -2061,7 +2082,7 @@ CURLcode operate(struct GlobalConfig *config, int argc, argv_item_t argv[])
         tool_version_info();
       /* Check if we were asked to list the SSL engines */
       else if(res == PARAM_ENGINES_REQUESTED)
-        tool_list_engines(config->easy);
+        tool_list_engines();
       else if(res == PARAM_LIBCURL_UNSUPPORTED_PROTOCOL)
         result = CURLE_UNSUPPORTED_PROTOCOL;
       else
@@ -2093,11 +2114,7 @@ CURLcode operate(struct GlobalConfig *config, int argc, argv_item_t argv[])
         /* Perform each operation */
         while(!result && config->current) {
           result = operate_do(config, config->current);
-
           config->current = config->current->next;
-
-          if(config->current && config->current->easy)
-            curl_easy_reset(config->current->easy);
         }
 
 #ifndef CURL_DISABLE_LIBCURL_OPTION
