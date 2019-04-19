@@ -632,7 +632,8 @@ static CURLcode CONNECT(struct connectdata *conn,
   conn->allocptr.proxyuserpwd = NULL;
 
   data->state.authproxy.done = TRUE;
-
+  data->state.authproxy.multipass = FALSE;
+  
   infof(data, "Proxy replied %d to CONNECT request\n",
         data->info.httpproxycode);
   data->req.ignorebody = FALSE; /* put it (back) to non-ignore state */
