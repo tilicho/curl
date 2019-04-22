@@ -299,6 +299,8 @@ man_MANS =                                      \
   CURLOPT_SSL_CIPHER_LIST.3                     \
   CURLOPT_SSL_CTX_DATA.3                        \
   CURLOPT_SSL_CTX_FUNCTION.3                    \
+  CURLOPT_SSL_DATA.3                            \
+  CURLOPT_SSL_FUNCTION.3                        \  
   CURLOPT_SSL_ENABLE_ALPN.3                     \
   CURLOPT_SSL_ENABLE_NPN.3                      \
   CURLOPT_SSL_FALSESTART.3                      \
