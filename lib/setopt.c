@@ -1805,6 +1805,28 @@ static CURLcode vsetopt(struct Curl_easy *data, CURLoption option,
 #endif
       result = CURLE_NOT_BUILT_IN;
     break;
+  case CURLOPT_SSL_FUNCTION:
+    /*
+     * Set a SSL callback
+     */
+#ifdef USE_SSL
+    if(Curl_ssl->supports & SSLSUPP_SSL_CTX)
+      data->set.ssl.fsslinit = va_arg(param, curl_ssl_callback);
+    else
+#endif
+      result = CURLE_NOT_BUILT_IN;
+    break;
+  case CURLOPT_SSL_DATA:
+    /*
+     * Set a SSL callback parameter pointer
+     */
+#ifdef USE_SSL
+    if(Curl_ssl->supports & SSLSUPP_SSL_CTX)
+      data->set.ssl.fsslinitp = va_arg(param, void *);
+    else
+#endif
+      result = CURLE_NOT_BUILT_IN;
+    break;
   case CURLOPT_SSL_FALSESTART:
     /*
      * Enable TLS false start.

@@ -2731,6 +2731,15 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
           "TLS extension\n");
 #endif
 
+  if(data->set.ssl.fsslinit) {
+    result = (*data->set.ssl.fsslinit)(
+      data, BACKEND->handle, data->set.ssl.fsslinitp);
+    if(result) {
+      failf(data, "error signaled by ssl init callback");
+      return result;
+    }
+  }
+
   /* Check if there's a cached ID we can/should use here! */
   if(SSL_SET_OPTION(primary.sessionid)) {
     void *ssl_sessionid = NULL;

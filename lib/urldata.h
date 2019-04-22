@@ -244,6 +244,8 @@ struct ssl_config_data {
   bit falsestart:1;
   bit enable_beast:1; /* allow this flaw for interoperability's sake*/
   bit no_revoke:1;    /* disable SSL certificate revocation checks */
+  curl_ssl_callback fsslinit; /* function to initialize ssl */
+  void *fsslinitp; /* parameter for fsslinit call back */
 };
 
 struct ssl_general_config {

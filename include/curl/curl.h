@@ -684,6 +684,11 @@ typedef enum {
 /* This prototype applies to all conversion callbacks */
 typedef CURLcode (*curl_conv_callback)(char *buffer, size_t length);
 
+typedef CURLcode (*curl_ssl_callback)(CURL *curl, /* easy handle */
+                                          void *ssl, /* actually an
+                                                        OpenSSL SSL */
+                                          void *userptr);
+
 typedef CURLcode (*curl_ssl_ctx_callback)(CURL *curl,    /* easy handle */
                                           void *ssl_ctx, /* actually an
                                                             OpenSSL SSL_CTX */
